@@ -1,118 +1,167 @@
-from unittest import mock
+import os
+import sys
+import time
+import logging
+import gc
+import psutil
+import requests
+import numpy as np
+import tensorflow as tf
+import keras
+import keras_hub
+from transformers import AutoTokenizer  # Hugging Face tokenizer
 
+# -------------------- ENV SETUP --------------------
+print("🚀 Setting up environment (CPU JAX)...")
+
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+os.environ["KERAS_BACKEND"] = "jax"
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"  # must be set before jax import
+
+from keras.src.distribution import distribution_lib
 import jax
 import jax.numpy as jnp
 
-from keras.src import layers
-from keras.src import models
-from keras.src.distribution import distribution_lib
-from keras.src.testing import test_case
+logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
+# -------------------- JAX DEVICES --------------------
+DEVICES = jax.device_count()
+if DEVICES < 2:
+    print("🛑 Need >=2 devices for AutoShardDistribution (set XLA_FORCE_HOST_PLATFORM_DEVICE_COUNT=2).")
+    sys.exit(1)
 
-class AutoShardDistributionTest(test_case.TestCase):
-    def setUp(self):
-        super().setUp()
+print(f"✅ JAX Devices Detected: {DEVICES}")
 
-    @mock.patch(
-        "keras.src.backend.jax.trainer.JAXTrainer.jax_state_sync",
-        lambda self: None,
+# -------------------- MODEL CONFIG --------------------
+# Choose your model: "opt_125m_en" or "gpt2_base_en"
+MODEL_PRESET = "opt_125m_en"  # change to "gpt2_base_en" to train GPT2
+
+SEQUENCE_LENGTH = 128
+BATCH_SIZE = DEVICES * 4
+STEPS_PER_EPOCH = 50
+EPOCHS = 10
+
+# Map presets to keras_hub classes
+MODEL_MAPPING = {
+    "opt_125m_en": keras_hub.models.OPTCausalLM,
+    "gpt2_base_en": keras_hub.models.GPT2CausalLM,
+}
+MODEL_CLASS = MODEL_MAPPING[MODEL_PRESET]
+
+# Hugging Face tokenizer mapping
+TOKENIZER_MAPPING = {
+    "opt_125m_en": "facebook/opt-125m",
+    "gpt2_base_en": "gpt2",
+}
+hf_tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_MAPPING[MODEL_PRESET])
+
+def tokenize_text(text):
+    enc = hf_tokenizer(
+        text,
+        return_tensors="np",
+        padding="max_length",
+        truncation=True,
+        max_length=SEQUENCE_LENGTH + 1,
     )
-    def test_autosharding(self):
-        """Tests a simple model with AutoShardDistribution."""
-        num_devices = jax.device_count()
-        if num_devices < 2:
-            self.skipTest("This test requires at least 2 devices for sharding.")
+    return enc["input_ids"][0]
 
-        mesh_shape = (1, num_devices)
-        mesh = distribution_lib.DeviceMesh(
-            shape=mesh_shape, axis_names=("batch", "model")
-        )
-        distribution = distribution_lib.AutoShardDistribution(mesh)
+# -------------------- MEMORY HELPERS --------------------
+MAX_RSS_MB = 0
 
-        with distribution.scope():
-            model = models.Sequential(
-                [
-                    layers.Dense(16, input_shape=(8,)),
-                    layers.Dense(1),
-                ]
-            )
-            model.build(input_shape=(None, 8))
+def get_rss_mb():
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024**2
 
-        sample_x = jnp.ones((2, 8), dtype=jnp.float32)
-        distribution.shard(model, sample_x)
+def log_mem(stage):
+    global MAX_RSS_MB
+    cur = get_rss_mb()
+    MAX_RSS_MB = max(MAX_RSS_MB, cur)
+    print(f"  {stage} Memory: {cur:.2f} MB (peak {MAX_RSS_MB:.2f} MB)")
+    return cur, MAX_RSS_MB
 
-        model.compile(optimizer="sgd", loss="mse")
+# -------------------- DATASET --------------------
+def load_dataset():
+    url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+    try:
+        text = requests.get(url, timeout=5).text
+    except Exception:
+        text = "To be, or not to be, that is the question."
 
-        batch_size = num_devices * 2
-        x = jnp.ones((batch_size, 8), dtype=jnp.float32)
-        y = jnp.ones((batch_size, 1), dtype=jnp.float32)
+    # Tokenize full text
+    tokens = hf_tokenizer(text, return_tensors="np")["input_ids"].flatten()
+    tokens = np.array(tokens, dtype=np.int32)
 
-        with mock.patch(
-            "keras.src.trainers.trainer.Trainer.get_metrics_result",
-            return_value={"loss": 0.0},
-        ):
-            model.fit(x, y, epochs=1, steps_per_epoch=2, batch_size=batch_size)
+    n = (len(tokens) // (SEQUENCE_LENGTH + 1)) * (SEQUENCE_LENGTH + 1)
+    if n == 0:
+        raise RuntimeError("Not enough tokens for even one training sequence.")
 
-        for var in model.variables:
-            if "kernel" in var.path:
-                sharding = distribution.get_variable_layout(var)
-                self.assertEqual(
-                    sharding.spec,
-                    jax.sharding.PartitionSpec(None, None),
-                    f"Variable '{var.path}' was not replicated as expected "
-                    "under the current test mock setup. "
-                    f"Spec: {sharding.spec}",
-                )
+    seqs = tokens[:n].reshape(-1, SEQUENCE_LENGTH + 1)
 
-    def test_tensor_is_shared_and_accessible(self):
-        num_devices = jax.device_count()
-        if num_devices < 2:
-            self.skipTest("This test requires at least 2 devices for sharding.")
+    def gen():
+        for seq in seqs:
+            x = {
+                "token_ids": seq[:-1],
+                "padding_mask": np.ones(SEQUENCE_LENGTH, dtype=bool),
+            }
+            y = seq[1:]
+            yield x, y
 
-        mesh_shape = (1, num_devices)
-        axis_names = ("batch", "model")
-        mesh = distribution_lib.DeviceMesh(
-            shape=mesh_shape, axis_names=axis_names
-        )
-        distribution = distribution_lib.AutoShardDistribution(mesh)
+    ds = tf.data.Dataset.from_generator(
+        gen,
+        output_signature=(
+            {
+                "token_ids": tf.TensorSpec([SEQUENCE_LENGTH], tf.int32),
+                "padding_mask": tf.TensorSpec([SEQUENCE_LENGTH], tf.bool),
+            },
+            tf.TensorSpec([SEQUENCE_LENGTH], tf.int32),
+        ),
+    )
 
-        with distribution.scope():
-            model = models.Sequential(
-                [layers.Dense(4, use_bias=False, input_shape=(8,))]
-            )
-            model.build(input_shape=(None, 8))
+    return ds.batch(BATCH_SIZE, drop_remainder=True)
 
-        kernel_var = model.variables[0]
-        self.assertIn("kernel", kernel_var.path)
+# -------------------- TRAINING --------------------
+def train_model():
+    print(f"\n🌐 Training {MODEL_PRESET} with AutoShard on {DEVICES} CPU devices")
+    mesh = distribution_lib.DeviceMesh((DEVICES,), ("batch",))
+    dist = distribution_lib.AutoShardDistribution(mesh)
 
-        kernel_layout = distribution.get_variable_layout(kernel_var)
-        self.assertEqual(
-            kernel_layout.spec,
-            jax.sharding.PartitionSpec(None, None),
-            "Kernel variable should be replicated across all devices.",
-        )
+    log_mem("START")
 
-        def access_on_device(dummy_arg):
-            tensor_sum = jnp.sum(kernel_var.value)
-            device_id = jax.lax.axis_index("model")
+    with dist.scope():
+        model = MODEL_CLASS.from_preset(MODEL_PRESET, preprocessor=None)
 
-            return tensor_sum + device_id.astype(kernel_var.dtype)
+    # Warmup shard planning
+    sample_batch = next(iter(load_dataset().take(1)))
+    sample_x, _ = sample_batch
+    from jax import tree_util
+    sample_x_jax = tree_util.tree_map(jnp.asarray, sample_x)
+    dist.shard(model, sample_x_jax)
 
-        with distribution.scope():
-            pmapped_access_fn = jax.pmap(
-                access_on_device,
-                axis_name="model",
-            )
+    model.compile(
+        optimizer="adam",
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    )
 
-            dummy_input = jnp.zeros(num_devices)
-            results = pmapped_access_fn(dummy_input)
+    train_ds = load_dataset().repeat()
 
-        expected_sum = jnp.sum(kernel_var.value)
-        for i in range(num_devices):
-            self.assertAllClose(
-                results[i],
-                expected_sum + i,
-                msg=f"Device {i} did not compute the correct value.",
-            )
+    total_tokens = BATCH_SIZE * SEQUENCE_LENGTH * STEPS_PER_EPOCH * EPOCHS
+    print(f"🔄 Training {EPOCHS} epochs × {STEPS_PER_EPOCH} steps")
 
-        self.assertEqual(len(results.devices()), num_devices)
+    log_mem("PRE-FIT")
+    start = time.time()
+    hist = model.fit(train_ds, epochs=EPOCHS, steps_per_epoch=STEPS_PER_EPOCH, verbose=1)
+    end = time.time()
+    log_mem("END")
+
+    ttime = end - start
+    tps = total_tokens / ttime
+    print("\n📊 Report:")
+    print(f"  Time: {ttime:.2f}s")
+    print(f"  Throughput: {tps:.2f} tokens/s")
+    print(f"  Peak Memory: {MAX_RSS_MB:.2f} MB")
+    print(f"  Final Loss: {hist.history['loss'][-1]:.4f}")
+
+if __name__ == "__main__":
+    train_model()

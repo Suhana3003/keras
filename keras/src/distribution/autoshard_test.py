@@ -17,7 +17,6 @@ print("🚀 Setting up environment (CPU JAX)...")
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["JAX_PLATFORM_NAME"] = "cpu"
 os.environ["KERAS_BACKEND"] = "jax"
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"  # must be set before jax import
 
 from keras.src.distribution import distribution_lib
 import jax
